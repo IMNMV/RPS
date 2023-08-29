@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Aug 25 22:42:19 2023
+
+@author: nyk
+"""
+
+# V1 adds more UI features since we know we can make it work!
+# V2 removes postgreSQL since the compatibiltiy issues were a NIGHTMARE
+# 6 works with postman but summary doesnt update and the model is slow to react to a stream vs the console version
+# 8 uses 6.55 version - works good enough to use as our first version to test on our website
+
+'''
+Starting a New Game
+
+To start a new game, you can use the following cURL request:
+
+bash
+
+curl -X POST -H "Content-Type: application/json" -d '{"user_name":"JohnDoe","personality":{"Extroversion": 1,"Agreeableness": 2,"Conscientiousness": 3,"Neuroticism": 4,"Openness": 5}}' http://127.0.0.1:5000/start_game
+
+This one remains unchanged. It sets up the user's name and personality traits.
+Making a Move
+
+For making a move, you'll now pass in the string value for the move ('r', 'p', or 's') instead of a numerical value:
+
+bash
+
+curl -X POST -H "Content-Type: application/json" -d '{"move": "r"}' http://127.0.0.1:5000/make_move
+
+This will make a move of 'Rock'. The server should respond with a summary of that move, including what the computer chose, who won, and some statistics.
+'''
+
+
+
+from flask import Flask, request, jsonify, abort
+from flask_cors import CORS
+import numpy as np
+import joblib
+
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import uuid
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+
+
+# Initialize logging
+logging.basicConfig(filename='rps_game.log', level=logging.INFO)
+
+# Initialize a thread-safe dictionary
+#game_states = ThreadPoolExecutor().submit(dict).result()
+
+
+
+
+app = Flask(__name__)
+CORS(app)  # This will allow your Flask app to accept requests from your WordPress site
+
+# Load the pre-trained model and Scaler
+#mlp_model = joblib.load('/Users/nyk/Desktop/DecentRPS.joblib')
+#scaler = joblib.load('/Users/nyk/Desktop/DecentRPS_Scaler.joblib')
+
+
+# Use relative path for Heroku
+mlp_model = joblib.load('DecentRPS.joblib')  # Now using relative path
+scaler = joblib.load('DecentRPS_Scaler.joblib')  # Now using relative path
+
+
+
+# Database setup
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///rps_game.db'  # SQLite for simplicity - switching to postgreSQL
+
+
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+
+
+# Constants for Rock, Paper, Scissors
+ROCK, PAPER, SCISSORS = 0, 1, 2
+# Constants for Rock, Paper, Scissors names
+MOVE_NAMES = {0: 'Rock', 1: 'Paper', 2: 'Scissors'}
+
+input_mapping = {'r': ROCK, 'rock': ROCK, 'p': PAPER, 'paper': PAPER, 's': SCISSORS, 'scissors': SCISSORS}
+
+# Store game states by user_id
+game_states = {}
+
+
+# Database models
+class User(db.Model):
+    id = db.Column(db.String, primary_key=True)
+    username = db.Column(db.String)
+    extroversion = db.Column(db.Integer)
+    agreeableness = db.Column(db.Integer)
+    conscientiousness = db.Column(db.Integer)
+    neuroticism = db.Column(db.Integer)
+    openness = db.Column(db.Integer)
+    game_rounds = db.relationship('GameRound', backref='user', lazy=True) # whats this for?
+    
+class GameRound(db.Model):
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.String, db.ForeignKey('user.id'))
+    user_move = db.Column(db.Integer)
+    comp_move = db.Column(db.Integer)
+    outcome = db.Column(db.String)
+    
+    # Personality traits (no changes here)
+    extroversion = db.Column(db.Integer)
+    agreeableness = db.Column(db.Integer)
+    conscientiousness = db.Column(db.Integer)
+    neuroticism = db.Column(db.Integer)
+    openness = db.Column(db.Integer)
+    
+    # Additional fields for stats and model features
+    model_win_streak = db.Column(db.Integer)  # Renamed
+    model_lose_streak = db.Column(db.Integer)  # Renamed
+    rock_count = db.Column(db.Integer)
+    paper_count = db.Column(db.Integer)
+    scissors_count = db.Column(db.Integer)
+    round_num = db.Column(db.Integer)
+
+    
+
+
+    
+
+# Initialize game state for a new user
+
+def initialize_game_state(user_id, user_name, personality):
+    game_states[user_id] = {
+        'model_win_streak': 0,
+        'model_lose_streak': 0,
+        'rock_count': 0,
+        'paper_count': 0,
+        'scissors_count': 0,
+        'comp_wins': 0,
+        'user_wins': 0,
+        'draws': 0,
+        'player_move_counts': {0: 0, 1: 0, 2: 0},
+        'recent_player_moves': [],
+        'round_num': 0,
+        'total_games': 0  # <-- New guy
+        
+    }
+
+
+
+
+def estimate_player_strategy(player_move_counts):
+    # Calculates the total number of moves made by the player
+    total_moves = sum(player_move_counts.values())
+    if total_moves == 0:
+        return 1  # Default to random if no moves have been made yet
+    
+    # Calculates the move that the player has made the most
+    max_move_count = max(player_move_counts.values())
+    
+    # If more than 30% of the moves are the same, assume the player is spamming
+    if max_move_count / total_moves > 0.3:
+        return 0  # Spamming
+    
+    # If all moves are made about equally (more than 20% each), assume random strategy
+    if all(count / total_moves > 0.2 for count in player_move_counts.values()):
+        return 1  # Random
+
+    # If none of the above conditions are met, assume the player is playing intelligently
+    return 2  # Intelligent
+
+
+@app.route('/start_game', methods=['POST'])
+def start_game():
+    try:
+        user_data = request.json
+
+        # Validate the data
+        if not all(isinstance(val, int) for val in user_data['personality'].values()):
+            abort(400, description="Personality traits should be integers.")
+        
+        user_name = user_data['user_name']
+        personality = user_data['personality']
+        
+        # Generate a unique user_id
+        user_id = str(uuid.uuid4())
+
+        # Create and commit a new User object
+        new_user = User(
+            id=user_id,
+            username=user_name,
+            extroversion=personality['Extroversion'],
+            agreeableness=personality['Agreeableness'],
+            conscientiousness=personality['Conscientiousness'],
+            neuroticism=personality['Neuroticism'],
+            openness=personality['Openness']
+        )
+        db.session.add(new_user)
+        db.session.commit()
+
+        # Initialize game variables
+        initialize_game_state(user_id, user_name, personality)  # Replacing the manual initialization
+        
+        # Fetch the game state for the user from game_states dictionary
+        game_state = game_states.get(user_id)
+        if not game_state:
+            return jsonify({"message": "Game not started"}), 400
+
+        # Increment the round number
+        game_state['round_num'] += 1
+
+
+        logging.info(f"Game started for user: {user_id}")
+
+        return jsonify({"message": "Game started", "user_id": user_id})
+
+
+        
+    except Exception as e:
+        print(f"Exception: {e}")  # Print it right to the console
+        logging.error(f"An error occurred while starting the game: {str(e)}")
+        abort(500, description="An error occurred while starting the game.")
+
+
+@app.route('/make_move', methods=['POST'])
+def make_move():
+    try:
+        # Attempt to parse incoming JSON data
+        try:
+            user_data = request.json
+        except Exception as e:
+            logging.error(f"Failed to parse incoming JSON: {e}")
+            return jsonify({"message": "Bad JSON format"}), 400
+
+        # Check if required fields exist
+        user_id = user_data.get('user_id')
+        if not user_id:
+            logging.error("No 'user_id' in request data")
+            return jsonify({"message": "Missing 'user_id'"}), 400
+
+        logging.info(f"Received request for user_id: {user_id}")
+
+        # Fetch user and check if it exists
+        user = User.query.get(user_id)
+        if not user:
+            logging.error(f"No user found for id: {user_id}")
+            return jsonify({"message": "User not found"}), 400
+
+        extroversion = user.extroversion
+        agreeableness = user.agreeableness
+        conscientiousness = user.conscientiousness
+        neuroticism = user.neuroticism
+        openness = user.openness
+        
+        
+
+        user_move = input_mapping.get(user_data.get('move', '').lower(), None)
+        if user_move is None:
+            return jsonify({"message": "Invalid input. Try again."}), 400
+
+        game_state = game_states.get(user_id)
+        if not game_state:
+            return jsonify({"message": "Game not started"}), 400
+
+        game_state['round_num'] += 1
+
+        #comp_move, outcome, features_scaled, next_move = process_move(user_move, game_state, mlp_model, scaler)
+        #comp_move, outcome, _, next_move = process_move(user_move, game_state, mlp_model, scaler)
+        
+        logging.info(f"user_move: {user_move}")
+        logging.info(f"game_state: {game_state}")
+        
+        try:
+            comp_move, outcome, _ = process_move(user_move, game_state, mlp_model, scaler)
+        except ValueError as ve:
+            logging.error(f"ValueError in process_move: {ve}")
+            return jsonify({"message": "Bad data in process_move"}), 400
+
+        
+        new_round = GameRound(
+            user_id=user_id,
+            user_move=user_move,
+            comp_move=comp_move,
+            outcome=outcome,
+            extroversion=extroversion,
+            agreeableness=agreeableness,
+            conscientiousness=conscientiousness,
+            neuroticism=neuroticism,
+            openness=openness,
+            model_win_streak=game_state['model_win_streak'],  # Updated
+            model_lose_streak=game_state['model_lose_streak'],  # Updated
+            rock_count=game_state['rock_count'],
+            paper_count=game_state['paper_count'],
+            scissors_count=game_state['scissors_count'],
+            round_num=game_state['round_num']
+        )
+
+        db.session.add(new_round)
+        db.session.commit()
+        logging.info(f"New round committed to database for user_id: {user_id}")
+
+     
+        
+        most_used_move = max(game_state['player_move_counts'], key=game_state['player_move_counts'].get)
+        least_used_move = min(game_state['player_move_counts'], key=game_state['player_move_counts'].get)
+        total_games = game_state.get('user_wins', 0) + game_state.get('comp_wins', 0) + game_state.get('draws', 0)
+        comp_win_rate = (game_state.get('comp_wins', 0) / total_games) if total_games > 0 else 0.0
+        
+        summary = {
+            "message": "Move made",
+            "comp_move": MOVE_NAMES[comp_move],
+            "outcome": outcome,
+            "stats": {
+                "user_wins": game_state.get('user_wins', 0),
+                "comp_wins": game_state.get('comp_wins', 0),
+                "draws": game_state.get('draws', 0),
+                "most_used_play": MOVE_NAMES[most_used_move],
+                "least_used_play": MOVE_NAMES[least_used_move],
+                "comp_win_rate": comp_win_rate,
+                "total_games": total_games# Add it here if you want to include it
+            }
+        }
+        
+        return jsonify(summary)
+        
+    except ValueError as ve:
+        logging.error(f"ValueError: {ve}")
+        return jsonify({"message": "Bad data format"}), 400
+    
+    except KeyError as ke:
+        logging.error(f"KeyError: {ke}")
+        return jsonify({"message": "Missing key in request"}), 400
+
+    except LookupError as le:
+        logging.error(f"LookupError: {le}")
+        return jsonify({"message": "User not found"}), 400
+    
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        return jsonify({"message": "Oof. Internal Server Error"}), 500
+
+
+
+
+
+def process_move(user_move, game_state, mlp_model, scaler):
+    # Extracting variables from game_state
+    model_win_streak = game_state['model_win_streak']
+    model_lose_streak = game_state['model_lose_streak']
+    player_move_counts = game_state['player_move_counts']
+    
+    # Update each round
+    game_state['round_num'] += 1
+    
+    # Update recent_player_moves
+    game_state['recent_player_moves'].append(user_move)
+    if len(game_state['recent_player_moves']) > 5:
+       game_state['recent_player_moves'].pop(0)
+       
+    
+
+
+    # Estimate the player strategy (Just as in your standalone code)
+    # Estimate the player strategy and map to a number (if needed)
+    estimated_strategy = estimate_player_strategy(game_state['player_move_counts'])
+
+
+        
+    # Preparing the feature vector for the model
+    features = np.array([[  
+        estimated_strategy,  # or estimated_strategy, depending on what your model expects
+        model_win_streak,
+        model_lose_streak,
+        player_move_counts[0],
+        player_move_counts[1],
+        player_move_counts[2]
+    ]])
+    
+    # Scale the features
+    features_scaled = scaler.transform(features)
+    
+    # Use the model to make the next move (MLP Model Prediction)
+    comp_move = mlp_model.predict(features_scaled)[0]
+    
+    # Update the models win/lose streaks (based on the outcome of the move)
+    if (comp_move - user_move) % 3 == 1:
+        model_win_streak += 1
+        model_lose_streak = 0
+    elif (user_move - comp_move) % 3 == 1:
+        model_win_streak = 0
+        model_lose_streak += 1
+
+    # Update the move counts (Just like you do in the standalone code)
+    player_move_counts[user_move] += 1
+
+    # Determine the outcome (Directly from your original code)
+    if user_move == comp_move:
+        outcome = "draw"
+        game_state['draws'] += 1  # <-- Update draws
+    elif (user_move - comp_move) % 3 == 1:
+        outcome = "user win"
+        game_state['user_wins'] += 1  # <-- Update user wins
+    else:
+        outcome = "comp win"
+        game_state['comp_wins'] += 1  # <-- Update comp wins
+        
+        # Update total games played
+        game_state['total_games'] += 1  # <-- Update total games
+        
+    
+
+    
+
+    # Update the game state
+    game_state['model_win_streak'] = model_win_streak
+    game_state['model_lose_streak'] = model_lose_streak
+    game_state['player_move_counts'] = player_move_counts
+    game_state['recent_player_moves'] = game_state['recent_player_moves']  
+    game_state['round_num'] = game_state['round_num']  # Likewise
+
+    
+
+    return comp_move, outcome, features_scaled
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
