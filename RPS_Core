@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Aug 23 15:35:23 2023
+
+@author: nyk
+"""
+
+
+
+# Big 5 Reference
+#https://openpsychometrics.org/tests/IPIP-BFFM/
+# Full code with UI improvements and summary stats
+
+
+
+# Importing necessary libraries
+import numpy as np
+import pandas as pd
+#from joblib import load
+#import time
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
+from sklearn.utils import shuffle
+from collections import Counter
+#from sklearn.externals import joblib
+import joblib
+#from sklearn.exceptions import ConvergenceWarning
+
+
+#from sklearn.metrics import accuracy_score, classification_report
+#from scipy.special import expit  # sigmoid function
+#from scipy.stats import beta
+
+
+#from sklearn.neural_network import MLPClassifier
+#from sklearn.model_selection import train_test_split
+#from sklearn.preprocessing import StandardScaler
+
+
+#takes this model and adds user input
+# saves all user input done
+# 5.2 enhances the UI
+# 5.3 converts to percentiles in the big 5
+# 5.4 works on making this usable in a website
+# 5.5 makes the overall code more generalizable - that is we take out the stringent assumptions that we made for the proof of concept model
+# 5.6 makes empirical assumptions based on file:///Users/nyk/Downloads/Explainable_AI_for_Psychological_Profiling_from_Di.pdf
+# 5.6 overfits - has perfect 1
+# 5.7 attempts to solve overfitting with exponential decay for streaks and non linearity for personality traits - still 1
+# 5.8 attempts to make personality traits normally distributed for the most part and add gaussian noise
+# 5.8 adding feature negineering helped drop to 91% might try in 5.7 version next to see how it helped but feature engineering is a gamble youre making a pretty arbritrary decision
+# 5.8 still doesnt work after adding more complex iteractions regularization, etc etc.even tried the old code Russell wrote and it overfits too.
+# my thinking is that we just create a dataset based on typical interactions you could expect, try testing it on that (without big 5) and get the real big 5 data from people as they play
+# 5.9 gets 42% which is actually good all things considered. We stripped down to the basics (no personality) and added harder regularlization and less logic like hot hand
+# 6.0 will focus on adding slightly more complexity to see if we can bump it up a bit
+# adding a counter strategy - didnt do much removed it for a leveling concept "I know that you know that I know" which brought accuracy to 65%
+# 6.1 adds back counter
+# 6.2 looks like it wasnt taking into account the model vs player where the model was predicitng what the player would do we made it so it predicts what a bunch of random ppl would choose vs a random computer
+# 6.3 back to 93 but sucks playing the game. doesnt change atrategies after constant moves either winning losing or drawing
+#6 .3 works!!! beat me 48% (not taking into account draws) in 50 mages
+#6.4 builds on 6.3 trying to think of common exploits people might tr - round_num isnt really used at the end (only the beginning functions) in here but doesnt seem to make a difference
+# 6.5 fixes round_num but doesnt seem to make a big impact - only use the full implementation in 6.5 and rollback in 6.4 if it has issues
+# 6.55 updates the round_num and recent moves since it wasnt being used properly in the simulated game
+
+# Suppress ConvergenceWarning
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+
+
+
+# Constants for moves
+ROCK, PAPER, SCISSORS = 0, 1, 2
+
+# Function to simulate PLAYER's move based on their strategy
+def player_move(strategy, game_history, round_num):
+    if strategy == 'spam':
+        return ROCK  # Always return Rock as a spam move
+    elif strategy == 'random':
+        return np.random.choice([ROCK, PAPER, SCISSORS])
+    elif strategy == 'intelligent':
+        # Implementing a hot-hand fallacy here: repeat the last winning move
+        last_win = [x for x in game_history if x['win'] == 1]
+        if last_win:
+            return last_win[-1]['player_move']
+        else:
+            return np.random.choice([ROCK, PAPER, SCISSORS])
+    elif strategy == 'long_game':
+        # Simple strategy for first 20 rounds, then switches
+        if round_num < 20:
+            return ROCK
+        else:
+            return (round_num % 3)
+    elif strategy == 'hot_cold_streaks':
+        # If on a winning streak of at least 3, stick with the last move, else random
+        last_three = game_history[-3:]
+        if all(x['win'] == 1 for x in last_three):
+            return last_three[-1]['player_move']
+        else:
+            return np.random.choice([ROCK, PAPER, SCISSORS])
+    elif strategy == 'random_counters':
+        # Counter the counter of the most frequent move
+        freq_move = max(set([x['player_move'] for x in game_history]), key=[x['player_move'] for x in game_history].count)
+        return (freq_move + 2) % 3  # counter of the counter
+
+# Function to simulate a single game (for the MODEL)
+# Updating the simulate_game function to handle the spamming strategy more effectively
+
+# Let's modify the simulate_game function to make the model's moves more dynamic and adaptive.
+# Update the existing code to include the new improvements
+def simulate_game(player_strategy, model_win_streak, model_lose_streak, player_move_counts, model_move_counts, recent_player_moves, round_num):
+    # Fetch the PLAYER's move based on their strategy
+    game_history = [{'player_move': move, 'win': win} for move, win in zip(player_move_counts.keys(), player_move_counts.values())]
+    next_player_move = player_move(player_strategy, game_history, round_num)
+    
+    
+    # Counter the player's most frequent move so far
+    most_frequent_player_move = max(player_move_counts, key=player_move_counts.get)
+    
+    # If the model is on a losing streak, let's counter the player's most frequent move
+    if model_lose_streak >= 3:
+        next_model_move = (most_frequent_player_move + 1) % 3
+    else:
+        # If the player has been repeating the same move, counter that
+        if len(set(recent_player_moves)) == 1 and len(recent_player_moves) >= 3:
+            next_model_move = (recent_player_moves[0] + 1) % 3
+        else:
+            # Otherwise, let's just try to counter the player's most frequent move
+            next_model_move = (most_frequent_player_move + 1) % 3
+
+    # Update win and lose streaks for the MODEL
+    if (next_model_move - next_player_move) % 3 == 1:
+        model_win_streak += 1
+        model_lose_streak = 0
+    elif (next_player_move - next_model_move) % 3 == 1:
+        model_win_streak = 0
+        model_lose_streak += 1
+    
+    # Update the move counts
+    player_move_counts[next_player_move] += 1
+    model_move_counts[next_model_move] += 1
+
+
+        
+    return model_win_streak, model_lose_streak, player_move_counts, model_move_counts, next_model_move, recent_player_moves
+
+
+
+# Note: You'll have to re-run the simulate_data function to generate new data with this modified logic.
+
+
+# Updating the simulate_data function to include recent_player_moves
+
+def simulate_data(num_players=1000):
+    data = []
+    for player_index in range(num_players):
+        player_strategy = np.random.choice(['spam', 'random', 'intelligent'])  # Randomly choose a strategy for the PLAYER
+        player_strategy_num = {'spam': 0, 'random': 1, 'intelligent': 2}[player_strategy]  # Convert strategy to numerical representation
+
+        model_win_streak, model_lose_streak = 0, 0
+        player_move_counts = {ROCK: 0, PAPER: 0, SCISSORS: 0}
+        model_move_counts = {ROCK: 0, PAPER: 0, SCISSORS: 0}
+        recent_player_moves = []
+        
+        for round_num in range(100):  # 100 rounds per PLAYER
+            model_win_streak, model_lose_streak, player_move_counts, model_move_counts, next_model_move, recent_player_moves = \
+                simulate_game(player_strategy, model_win_streak, model_lose_streak, player_move_counts, model_move_counts, recent_player_moves, round_num)
+            
+            # Append data for this round
+            data.append([
+                player_strategy_num,  # Use numerical representation for strategy
+                model_win_streak,
+                model_lose_streak,
+                player_move_counts[ROCK],
+                player_move_counts[PAPER],
+                player_move_counts[SCISSORS],
+                next_model_move  # Target variable
+            ])
+            
+    # Create DataFrame
+    columns = ['Player_Strategy_Num', 'Model_Win_Streak', 'Model_Lose_Streak', 'Player_Rock_Count', 'Player_Paper_Count', 'Player_Scissors_Count', 'Model_Next_Move']
+    df = pd.DataFrame(data, columns=columns)
+    
+    return df
+
+# Generate the DataFrame
+df = simulate_data()
+df = shuffle(df)  # Shuffle the data
+df.head()
+
+df
+
+
+
+
+
+
+# The target column is 'Model_Next_Move', not 'Next_Move'
+# Features and target variable
+X = df.drop(columns=['Model_Next_Move'])
+y = df['Model_Next_Move']
+
+
+# Splitting the data into training and validation sets (80% training, 20% validation)
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Normalizing the features using StandardScaler
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+
+# Creating a multi-layer perceptron (MLP) neural network with L2 regularization and early stopping
+mlp_model_with_reg = MLPClassifier(hidden_layer_sizes=(10,), 
+                                   activation='relu', 
+                                   solver='adam', 
+                                   alpha=0.01,  # Increased L2 regularization term
+                                   early_stopping=True,  # Enable early stopping
+                                   max_iter=500, 
+                                   random_state=42)
+
+# Training the neural network on the scaled training data
+mlp_model_with_reg.fit(X_train_scaled, y_train)
+
+# Evaluating the model's accuracy on the validation set
+validation_accuracy_with_reg = mlp_model_with_reg.score(X_val_scaled, y_val)
+
+# Output the validation accuracy
+validation_accuracy_with_reg
+
+
+
+
+## Testing the model
+
+
+
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# Creating a multi-layer perceptron (MLP) neural network model
+mlp_model_with_reg = MLPClassifier(hidden_layer_sizes=(10,), 
+                                   activation='relu', 
+                                   solver='adam', 
+                                   alpha=0.01,  # L2 regularization term
+                                   early_stopping=True,  # Enable early stopping
+                                   max_iter=500, 
+                                   random_state=42)
+
+# Splitting the data into training and validation sets (80% training, 20% validation)
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Normalizing the features using StandardScaler
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+
+# Training the neural network on the scaled training data
+mlp_model_with_reg.fit(X_train_scaled, y_train)
+
+# Evaluating the model's accuracy on the validation set
+validation_accuracy_with_reg = mlp_model_with_reg.score(X_val_scaled, y_val)
+validation_accuracy_with_reg
+
+def simulate_game_with_ml(mlp_model, scaler, player_strategy, model_win_streak, model_lose_streak, player_move_counts, model_move_counts, recent_player_moves, round_num):
+    # Fetch the PLAYER's move based on their strategy
+    game_history = [{'player_move': move, 'win': win} for move, win in zip(player_move_counts.keys(), player_move_counts.values())]
+    next_player_move = player_move(player_strategy, game_history, round_num)  # Added round_num for the 'long_game' strategy
+    
+    # Rest of the code remains largely the same
+    player_strategy_num = {'spam': 0, 'random': 1, 'intelligent': 2, 'long_game': 3, 'hot_cold_streaks': 4, 'random_counters': 5}[player_strategy]
+    feature_vector = np.array([
+        player_strategy_num,
+        model_win_streak,
+        model_lose_streak,
+        player_move_counts[ROCK],
+        player_move_counts[PAPER],
+        player_move_counts[SCISSORS],
+
+    ]).reshape(1, -1)
+    
+    feature_vector_scaled = scaler.transform(feature_vector)
+    next_model_move = mlp_model.predict(feature_vector_scaled)[0]
+    
+    if (next_model_move - next_player_move) % 3 == 1:
+        model_win_streak += 1
+        model_lose_streak = 0
+    elif (next_player_move - next_model_move) % 3 == 1:
+        model_win_streak = 0
+        model_lose_streak += 1
+    
+    player_move_counts[next_player_move] += 1
+    model_move_counts[next_model_move] += 1
+    
+    # Update recent_player_moves to store the last 5 moves
+    recent_player_moves.append(next_player_move)
+    if len(recent_player_moves) > 5:
+        recent_player_moves.pop(0)
+        
+     # Increment the round_num
+    round_num += 1
+
+    
+    return model_win_streak, model_lose_streak, player_move_counts, model_move_counts, next_model_move, recent_player_moves, round_num
+
+# These changes should now incorporate the new strategies into the simulation.
+
+
+# Let's test the function with some initial game state
+player_strategy = 'random'
+model_win_streak, model_lose_streak = 0, 0
+player_move_counts = {ROCK: 0, PAPER: 0, SCISSORS: 0}
+model_move_counts = {ROCK: 0, PAPER: 0, SCISSORS: 0}
+#recent_player_moves = []
+#round_num = []
+recent_player_moves = []
+round_num = 0
+# Simulate one round of the game
+
+simulate_game_with_ml(mlp_model_with_reg, scaler, player_strategy, model_win_streak, model_lose_streak, player_move_counts, model_move_counts, recent_player_moves, round_num)
+
+
+# Play against the model
+warnings.filterwarnings('ignore')
+
+# Modifying the play_game_against_model function to use the features the model was trained on
+
+
+
+
+# The helper function to estimate the player's strategy
+def estimate_player_strategy(player_move_counts):
+    # Calculates the total number of moves made by the player
+    total_moves = sum(player_move_counts.values())
+    if total_moves == 0:
+        return 1  # Default to random if no moves have been made yet
+    
+    # Calculates the move that the player has made the most
+    max_move_count = max(player_move_counts.values())
+    
+    # If more than 70% of the moves are the same, assume the player is spamming
+    if max_move_count / total_moves > 0.7:
+        return 0  # Spamming
+    
+    # If all moves are made about equally (more than 20% each), assume random strategy
+    if all(count / total_moves > 0.2 for count in player_move_counts.values()):
+        return 1  # Random
+
+    # If none of the above conditions are met, assume the player is playing intelligently
+    return 2  # Intelligent
+
+# Main function to play the game against the model
+
+import warnings
+
+def play_game_against_model(model, scaler, rounds=30):
+    # Initialize counts and streaks
+    win_count = 0
+    lose_count = 0
+    draw_count = 0
+    model_win_streak = 0
+    model_lose_streak = 0
+    player_move_counts = Counter({0: 0, 1: 0, 2: 0})
+    recent_player_moves = []  # Added to keep track of the last 5 moves
+    round_num = 0  # Added to keep track of the round number
+    
+    # Move mappings
+    num_to_move = {0: 'Rock', 1: 'Paper', 2: 'Scissors'}
+    move_to_num = {'rock': 0, 'paper': 1, 'scissors': 2}
+    
+    for i in range(rounds):
+        # Get user move
+        while True:
+            user_move = input(f"Round {i+1}: Enter your move (Rock/Paper/Scissors): ").lower()
+            if user_move in ['rock', 'paper', 'scissors']:
+                break
+            else:
+                print("Invalid response. Please enter Rock, Paper, or Scissors.")
+        
+        user_move_num = move_to_num[user_move]
+        player_move_counts[user_move_num] += 1
+        
+        # Update recent_player_moves and round_num
+        recent_player_moves.append(user_move_num)
+        if len(recent_player_moves) > 5:
+            recent_player_moves.pop(0)
+        round_num += 1  # Increment round number
+        
+        # Estimate player strategy
+        player_strategy_num = estimate_player_strategy(player_move_counts)  # Assuming you have this function
+        
+        # Prepare feature vector
+        features = np.array([[
+            player_strategy_num,
+            model_win_streak,
+            model_lose_streak,
+            player_move_counts[0],
+            player_move_counts[1],
+            player_move_counts[2]
+        ]])
+        
+        # Scale the features and make model prediction
+        features_scaled = scaler.transform(features)
+        model_move = model.predict(features_scaled)[0]
+        
+        # Update win/lose streaks and counts
+        if (model_move - user_move_num) % 3 == 1:
+            print(f"You lose this round! Model chose {num_to_move[model_move]}")
+            lose_count += 1
+            model_win_streak += 1
+            model_lose_streak = 0
+        elif (user_move_num - model_move) % 3 == 1:
+            print(f"You win this round! Model chose {num_to_move[model_move]}")
+            win_count += 1
+            model_win_streak = 0
+            model_lose_streak += 1
+        else:
+            print(f"It's a draw! Model also chose {num_to_move[model_move]}")
+            draw_count += 1
+
+    # Summary of the game
+    print("\nSummary:")
+    print(f"Rounds Won by You: {win_count}")
+    print(f"Rounds Won by Model: {lose_count}")
+    print(f"Draws: {draw_count}")
+    print(f"Model's Win Rate: {(lose_count / rounds) * 100:.2f}%")
+
+
+
+# This function should now be ready to play a game against you, using the features the model was trained on.
+# Would you like to give it a try?
+
+play_game_against_model(mlp_model_with_reg, scaler)
+
+
+# Works nicely. Pretty hard to beat and can counter basic tricks within 1-3 rounds.
+
+joblib.dump(mlp_model_with_reg, '/Users/nyk/Desktop/DecentRPS.joblib')
+
+# If you also have a different scaler for this model
+joblib.dump(scaler, '/Users/nyk/Desktop/DecentRPS_Scaler.joblib')
+
+
+
+
+
+
+# Plots/Graphs
+
+# With console print out
+
+# Initialize the MLP Classifier
+mlp = MLPClassifier(hidden_layer_sizes=(10,), activation='relu', solver='adam', alpha=0.01, 
+                    max_iter=1, warm_start=True, random_state=42)
+
+train_losses = []
+val_accuracies = []
+
+# Suppress specific warning within this block
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    
+    # Your loop goes here
+    # Manually iterate through epochs
+    for i in range(1, 101):  # 100 epochs
+      mlp.fit(X_train_scaled, y_train)
+      
+      # Capture training loss
+      train_loss = mlp.loss_
+      train_losses.append(train_loss)
+      
+      # Evaluate on validation set and capture accuracy
+      val_predictions = mlp.predict(X_val_scaled)
+      val_accuracy = accuracy_score(y_val, val_predictions)
+      val_accuracies.append(val_accuracy)
+      
+      print(f"Epoch {i}: Training loss = {train_loss}, Validation accuracy = {val_accuracy}")
+
+
+# Visualizing another way to looking at validation
+
+
+# Now you can plot these metrics if you want
+# Plotting the training and validation loss over epochs
+plt.figure(figsize=(12, 6))
+plt.plot(mlp_model_with_reg.loss_curve_, label='Training Loss')
+if mlp_model_with_reg.validation_scores_ is not None:
+    plt.plot(mlp_model_with_reg.validation_scores_, label='Validation Scores')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss Over Epochs')
+plt.legend()
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
